@@ -1,0 +1,14 @@
+# Python requirements for cursor-exporter
+# This project uses only Python standard library modules
+# Minimum Python version: 3.7 (for Path.exists() and other pathlib features)
+
+# No external dependencies required for main functionality
+# All functionality is provided by Python standard library:
+# - sqlite3 (database access)
+# - json (JSON parsing)
+# - pathlib (cross-platform path handling)
+# - argparse (command line argument parsing)
+# - datetime (timestamp generation)
+
+# Optional dependencies for development/testing:
+# pytest>=6.0  # For running tests with pytest instead of unittest
