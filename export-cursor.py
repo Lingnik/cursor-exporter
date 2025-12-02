@@ -22,18 +22,31 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
-def get_global_cursor_db_path() -> str:
-    """Return path to global Cursor database containing conversation data."""
+def get_cursor_base_path() -> str:
+    """Return base path to Cursor's user data directory."""
     if sys.platform == 'darwin':
-        return os.path.expanduser('~/Library/Application Support/Cursor/User/globalStorage/state.vscdb')
+        return os.path.expanduser('~/Library/Application Support/Cursor/User')
     elif sys.platform.startswith('win'):
         appdata = os.environ.get('APPDATA') or os.path.expanduser(
             '~\\AppData\\Roaming')
-        return os.path.join(appdata, 'Cursor', 'User', 'globalStorage', 'state.vscdb')
+        return os.path.join(appdata, 'Cursor', 'User')
     else:
         xdg = os.environ.get(
             'XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
-        return os.path.join(xdg, 'Cursor', 'User', 'globalStorage', 'state.vscdb')
+        return os.path.join(xdg, 'Cursor', 'User')
+
+
+def get_global_cursor_db_path() -> str:
+    """Return path to global Cursor database containing conversation data."""
+    return os.path.join(get_cursor_base_path(), 'globalStorage', 'state.vscdb')
+
+
+def get_workspace_db_paths() -> List[str]:
+    """Return paths to all workspace-specific Cursor databases."""
+    import glob
+    base_path = get_cursor_base_path()
+    workspace_pattern = os.path.join(base_path, 'workspaceStorage', '*', 'state.vscdb')
+    return glob.glob(workspace_pattern)
 
 
 def connect_db_readonly(db_path: str) -> sqlite3.Connection:
@@ -43,26 +56,97 @@ def connect_db_readonly(db_path: str) -> sqlite3.Connection:
 
 
 def get_composer_threads(conn: sqlite3.Connection) -> List[Tuple[str, Dict[str, Any]]]:
-    """Get all composer threads with their metadata."""
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT substr(key, length('composerData:')+1) AS cid, value
-        FROM cursorDiskKV
-        WHERE key LIKE 'composerData:%'
-        ORDER BY json_extract(value,'$.createdAt') DESC
-    """)
-
+    """Get all composer threads with their metadata from a single database."""
     threads = []
-    for cid, value_blob in cursor.fetchall():
-        try:
-            if value_blob is None:
+    cursor = conn.cursor()
+    
+    # Check cursorDiskKV table for composerData entries
+    try:
+        cursor.execute("""
+            SELECT substr(key, length('composerData:')+1) AS cid, value
+            FROM cursorDiskKV
+            WHERE key LIKE 'composerData:%'
+        """)
+        
+        for cid, value_blob in cursor.fetchall():
+            try:
+                if value_blob is None:
+                    continue
+                data = json.loads(value_blob)
+                threads.append((cid, data))
+            except (json.JSONDecodeError, TypeError):
                 continue
-            data = json.loads(value_blob)
-            threads.append((cid, data))
-        except (json.JSONDecodeError, TypeError):
-            continue
-
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist or is empty
+    
+    # Check ItemTable for composer.composerData with allComposers array
+    try:
+        cursor.execute("""
+            SELECT value FROM ItemTable 
+            WHERE key = 'composer.composerData'
+        """)
+        
+        result = cursor.fetchone()
+        if result and result[0]:
+            try:
+                data = json.loads(result[0])
+                if isinstance(data, dict) and 'allComposers' in data:
+                    for composer in data['allComposers']:
+                        if isinstance(composer, dict) and 'composerId' in composer:
+                            cid = composer['composerId']
+                            threads.append((cid, composer))
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist
+    
     return threads
+
+
+def get_all_composer_threads(verbose: bool = False) -> List[Tuple[str, Dict[str, Any]]]:
+    """Get all composer threads from global and workspace databases."""
+    all_threads = {}  # Use dict to deduplicate by cid
+    
+    # Get from global database
+    global_db = get_global_cursor_db_path()
+    if os.path.exists(global_db):
+        if verbose:
+            print(f"Searching global database...")
+        try:
+            conn = connect_db_readonly(global_db)
+            threads = get_composer_threads(conn)
+            for cid, data in threads:
+                all_threads[cid] = data
+            conn.close()
+            if verbose:
+                print(f"  Found {len(threads)} threads in global database")
+        except Exception as e:
+            if verbose:
+                print(f"  Error reading global database: {e}")
+    
+    # Get from workspace databases
+    workspace_dbs = get_workspace_db_paths()
+    if verbose:
+        print(f"Searching {len(workspace_dbs)} workspace databases...")
+    
+    for db_path in workspace_dbs:
+        try:
+            conn = connect_db_readonly(db_path)
+            threads = get_composer_threads(conn)
+            for cid, data in threads:
+                # Keep the most recently updated version
+                if cid not in all_threads or data.get('lastUpdatedAt', 0) > all_threads[cid].get('lastUpdatedAt', 0):
+                    all_threads[cid] = data
+            conn.close()
+        except Exception:
+            pass  # Skip databases that can't be opened
+    
+    if verbose:
+        print(f"Total unique threads found: {len(all_threads)}")
+    
+    # Sort by creation date (newest first)
+    sorted_threads = sorted(all_threads.items(), key=lambda x: x[1].get('createdAt', 0), reverse=True)
+    return sorted_threads
 
 
 def get_thread_bubbles(conn: sqlite3.Connection, cid: str) -> List[Dict[str, Any]]:
@@ -164,12 +248,26 @@ def extract_intermediate_actions(bubble: Dict[str, Any]) -> List[str]:
     if isinstance(tool_former_data, dict):
         tool_name = tool_former_data.get('name', '')
 
-        # Parse tool arguments
-        raw_args = tool_former_data.get('rawArgs', '')
-        try:
-            args = json.loads(raw_args) if raw_args else {}
-        except json.JSONDecodeError:
-            args = {}
+        # Parse tool arguments - handle None, empty string, or JSON string
+        raw_args = tool_former_data.get('rawArgs')
+        args = {}
+        if raw_args:
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        
+        # Fallback: try to parse params field if rawArgs is missing
+        if not args and tool_former_data.get('params'):
+            try:
+                params_str = tool_former_data.get('params', '')
+                if isinstance(params_str, str):
+                    params_data = json.loads(params_str)
+                    # Extract args from params if available
+                    if isinstance(params_data, dict):
+                        args = params_data
+            except (json.JSONDecodeError, TypeError):
+                pass
 
         # Parse tool results
         result_data = {}
@@ -201,8 +299,7 @@ def extract_intermediate_actions(bubble: Dict[str, Any]) -> List[str]:
                         end_line = code_block.get('endLine', '')
                         if file_path:
                             if start_line and end_line:
-                                actions.append(f"   📁 {file_path}:{
-                                               start_line}-{end_line}")
+                                actions.append(f"   📁 {file_path}:{start_line}-{end_line}")
                             else:
                                 actions.append(f"   📁 {file_path}")
 
@@ -211,26 +308,33 @@ def extract_intermediate_actions(bubble: Dict[str, Any]) -> List[str]:
             offset = args.get('offset')
             limit = args.get('limit')
 
-            action_str = f"📖 Read file: {file_path}"
-            if offset is not None or limit is not None:
-                action_str += f" (lines {offset or 1}"
-                if limit:
-                    action_str += f"-{(offset or 1) + limit - 1}"
-                action_str += ")"
-            actions.append(action_str)
+            if file_path:
+                action_str = f"📖 Read file: {file_path}"
+                if offset is not None or limit is not None:
+                    action_str += f" (lines {offset or 1}"
+                    if limit:
+                        action_str += f"-{(offset or 1) + limit - 1}"
+                    action_str += ")"
+                actions.append(action_str)
+            else:
+                # Tool called but args missing (likely incomplete/cancelled)
+                actions.append(f"📖 Read file: (args unavailable)")
 
         elif tool_name == 'write':
             file_path = args.get('file_path', '')
             contents = args.get('contents', '')
             line_count = len(contents.split('\n')) if contents else 0
 
-            actions.append(f"✏️ Write file: {file_path}")
-            if line_count > 0:
-                actions.append(f"   → {line_count} lines written")
+            if file_path:
+                actions.append(f"✏️ Write file: {file_path}")
+                if line_count > 0:
+                    actions.append(f"   → {line_count} lines written")
 
-                # Include full file contents for audit completeness
-                actions.append("   Contents:")
-                actions.extend(format_code_block(contents, prefix='   | '))
+                    # Include full file contents for audit completeness
+                    actions.append("   Contents:")
+                    actions.extend(format_code_block(contents, prefix='   | '))
+            else:
+                actions.append(f"✏️ Write file: (args unavailable)")
 
         elif tool_name == 'search_replace':
             file_path = args.get('file_path', '')
@@ -238,11 +342,14 @@ def extract_intermediate_actions(bubble: Dict[str, Any]) -> List[str]:
             new_string = args.get('new_string', '')
             replace_all = args.get('replace_all', False)
 
-            actions.append(f"🔧 Edit file: {file_path}")
+            if file_path:
+                actions.append(f"🔧 Edit file: {file_path}")
+            else:
+                actions.append(f"🔧 Edit file: (args unavailable)")
 
             # Include the actual diff context from the database
             # This makes the content grep-able without losing information
-            if old_string or new_string:
+            if file_path and (old_string or new_string):
                 # Show what was removed
                 if old_string.strip():
                     actions.append("   Old:")
@@ -274,10 +381,14 @@ def extract_intermediate_actions(bubble: Dict[str, Any]) -> List[str]:
             command = args.get('command', '')
             is_background = args.get('is_background', False)
 
-            action_str = f"💻 Run: `{command}`"
-            if is_background:
-                action_str += " (background)"
-            actions.append(action_str)
+            if command:
+                action_str = f"💻 Run: `{command}`"
+                if is_background:
+                    action_str += " (background)"
+                actions.append(action_str)
+            else:
+                # Tool called but args missing (likely incomplete/cancelled)
+                actions.append(f"💻 Run: (args unavailable)")
 
             # Include full command output for grep-ability
             result = result_data.get('output', '')
@@ -359,8 +470,7 @@ def extract_intermediate_actions(bubble: Dict[str, Any]) -> List[str]:
             todos = args.get('todos', [])
             merge = args.get('merge', False)
 
-            action_str = f"📝 TODO: {
-                'Update' if merge else 'Create'} {len(todos)} item(s)"
+            action_str = f"📝 TODO: {'Update' if merge else 'Create'} {len(todos)} item(s)"
             actions.append(action_str)
 
             # Show ALL todo items
@@ -406,8 +516,7 @@ def extract_intermediate_actions(bubble: Dict[str, Any]) -> List[str]:
     # Note: Most web search results are now in the tool's result field (handled above)
     web_search = bubble.get('aiWebSearchResults', [])
     if web_search:
-        actions.append(f"🌐 Additional web search results: {
-                       len(web_search)} result(s)")
+        actions.append(f"🌐 Additional web search results: {len(web_search)} result(s)")
         for i, result in enumerate(web_search, 1):
             if isinstance(result, dict):
                 title = result.get('title', 'Untitled')
@@ -862,25 +971,43 @@ def format_conversation_markdown(thread_data: Dict[str, Any], cid: str, bubbles:
     return '\n'.join(md_lines)
 
 
-def export_conversations(output_dir: str, verbose: bool = False) -> None:
-    """Export all Cursor conversations to markdown files."""
+def export_conversations(output_dir: str, verbose: bool = False, min_timestamp_ms: int = None) -> None:
+    """Export all Cursor conversations to markdown files.
+    
+    Args:
+        output_dir: Directory to export markdown files to
+        verbose: Enable verbose output
+        min_timestamp_ms: Optional minimum timestamp (milliseconds) to filter conversations
+    """
     # Setup
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    db_path = get_global_cursor_db_path()
-    if not os.path.exists(db_path):
-        print(f"Error: Cursor global database not found at {db_path}")
-        return
-
     if verbose:
-        print(f"Connecting to: {db_path}")
+        if min_timestamp_ms:
+            min_dt = datetime.fromtimestamp(min_timestamp_ms / 1000)
+            print(f"Filtering conversations created after: {min_dt}")
 
-    # Connect and export
-    conn = connect_db_readonly(db_path)
+    # Get all threads from global and workspace databases
+    threads = get_all_composer_threads(verbose)
+    
+    # Filter by timestamp if provided
+    if min_timestamp_ms:
+        threads = [(cid, data) for cid, data in threads 
+                  if data.get('createdAt', 0) >= min_timestamp_ms]
+    
+    if verbose:
+        print(f"Processing {len(threads)} conversation threads")
+
+    # Open a connection to global DB for getting bubbles (they're still there)
+    global_db = get_global_cursor_db_path()
+    if not os.path.exists(global_db):
+        print(f"Error: Cursor global database not found at {global_db}")
+        return
+    
+    conn = connect_db_readonly(global_db)
 
     try:
-        threads = get_composer_threads(conn)
 
         if verbose:
             print(f"Found {len(threads)} conversation threads")
@@ -932,8 +1059,7 @@ def export_conversations(output_dir: str, verbose: bool = False) -> None:
         # Export terminal history as a separate file
         export_terminal_history(output_path, conn, verbose)
 
-        print(f"Export complete! Exported {
-              exported_count} conversations to: {output_path}")
+        print(f"Export complete! Exported {exported_count} conversations to: {output_path}")
 
     finally:
         conn.close()
@@ -1082,8 +1208,7 @@ def generate_file_modification_timeline(output_path: Path, conn: sqlite3.Connect
                     detail_str = f": {detail_str}"
 
                 md_lines.append(
-                    f"- **{mod['timestamp_str']
-                           }** — {mod['action']}{detail_str}  "
+                    f"- **{mod['timestamp_str']}** — {mod['action']}{detail_str}  "
                     f"  *[{mod['thread_name']}]* `({mod['cid']})`"
                 )
 
@@ -1097,8 +1222,7 @@ def generate_file_modification_timeline(output_path: Path, conn: sqlite3.Connect
             f.write('\n'.join(md_lines))
 
         if verbose:
-            print(f"Generated file modification timeline: {
-                  len(file_timeline)} files tracked")
+            print(f"Generated file modification timeline: {len(file_timeline)} files tracked")
 
     except Exception as e:
         if verbose:
@@ -1203,10 +1327,12 @@ def main():
         'output_dir', help='Directory to export markdown files to')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose output')
+    parser.add_argument('--min-timestamp-ms', type=int, default=None,
+                        help='Minimum timestamp (milliseconds) to filter conversations')
 
     args = parser.parse_args()
 
-    export_conversations(args.output_dir, args.verbose)
+    export_conversations(args.output_dir, args.verbose, args.min_timestamp_ms)
 
 
 if __name__ == '__main__':

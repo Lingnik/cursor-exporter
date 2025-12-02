@@ -48,3 +48,6 @@ htmlcov/
 .Trashes
 ehthumbs.db
 Thumbs.db
+# Machine-specific schema snapshots (contain local paths)
+schemas/cursor-schema.json
+schemas/cursor-workspace-schema.json
