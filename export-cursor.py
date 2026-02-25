@@ -12,6 +12,7 @@ Key findings:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import sqlite3
@@ -20,6 +21,8 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+LOCK_FILE = '/tmp/export-cursor.lock'
 
 
 def get_cursor_base_path() -> str:
@@ -170,6 +173,39 @@ def get_thread_bubbles(conn: sqlite3.Connection, cid: str) -> List[Dict[str, Any
             continue
 
     return bubbles
+
+
+def get_bubbles_batch(conn: sqlite3.Connection, cid_set: set) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch bubbles for multiple CIDs in a single table scan.
+
+    A single pass over all bubbleId:* rows is ~250ms, far cheaper than
+    one LIKE query per CID (~34ms each × N threads).
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT key, value
+        FROM cursorDiskKV
+        WHERE key LIKE 'bubbleId:%'
+        ORDER BY COALESCE(json_extract(value, '$.createdAt'), 0) ASC
+    """)
+
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    for key, value_blob in cursor:
+        # key format: bubbleId:{cid}:{bubble_id}
+        rest = key[9:]  # strip 'bubbleId:'
+        colon = rest.find(':')
+        if colon == -1:
+            continue
+        cid = rest[:colon]
+        if cid not in cid_set or value_blob is None:
+            continue
+        try:
+            bubble = json.loads(value_blob)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        result.setdefault(cid, []).append(bubble)
+
+    return result
 
 
 def extract_message_content(bubble: Dict[str, Any]) -> str:
@@ -1012,10 +1048,30 @@ def export_conversations(output_dir: str, verbose: bool = False, min_timestamp_m
         if verbose:
             print(f"Found {len(threads)} conversation threads")
 
+        # Pre-index existing files by cid short-hash (last 8 chars of stem before .md)
+        # Filename format: {timestamp}-{slug}-{cid[:8]}.md
+        existing_by_cid: Dict[str, Path] = {}
+        for f in output_path.glob('*.md'):
+            existing_by_cid[f.stem[-8:]] = f
+
         exported_count = 0
 
+        # Partition threads into up-to-date (skip) vs. needs-export, then
+        # batch-fetch all bubble data for the latter in a single table scan.
+        needs_export = []
         for cid, thread_data in threads:
-            bubbles = get_thread_bubbles(conn, cid)
+            cid_short = cid[:8]
+            thread_updated_ms = thread_data.get('lastUpdatedAt', thread_data.get('createdAt', 0))
+            if thread_updated_ms and cid_short in existing_by_cid:
+                if existing_by_cid[cid_short].stat().st_mtime * 1000 >= thread_updated_ms:
+                    exported_count += 1
+                    continue
+            needs_export.append((cid, thread_data))
+
+        bubbles_by_cid = get_bubbles_batch(conn, {cid for cid, _ in needs_export})
+
+        for cid, thread_data in needs_export:
+            bubbles = bubbles_by_cid.get(cid, [])
 
             if not bubbles:
                 if verbose:
@@ -1047,6 +1103,7 @@ def export_conversations(output_dir: str, verbose: bool = False, min_timestamp_m
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(markdown_content)
 
+                existing_by_cid[cid_short] = file_path
                 exported_count += 1
 
                 if verbose:
@@ -1336,4 +1393,17 @@ def main():
 
 
 if __name__ == '__main__':
+    import time as _time
+
+    _lock_fd = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("export-cursor: another instance is already running, exiting")
+        sys.exit(0)
+
+    _start = _time.time()
+    _start_iso = _time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime(_start))
     main()
+    with open(os.path.expanduser('~/log/cron.log'), 'a') as _f:
+        _f.write(f'{_start_iso}\t{int(_time.time() - _start)}\texport-cursor.py\n')
